@@ -1,37 +1,41 @@
 /**
- * Simplified ITU-R BS.1770 / EBU R128 integrated loudness + true-peak limiter.
+ * ITU-R BS.1770-4 / EBU R128 integrated loudness + true peak.
+ *
+ * K-weighting nach ITU-R BS.1770-4 (B. De Man's exakte Biquad-Design-Gleichungen,
+ * identisch zu pyloudnorm filter_class='DeMan'):
+ *  - High-Shelf  f0 = 1681.9745 Hz, +3.9998 dB, Q = 0.70718  (K = tan(pi·f0/fs))
+ *  - Highpass    f0 = 38.1355 Hz             Q = 0.50033
+ * Gating: 400 ms Blöcke, 75 % Überlappung, absolutes Gate −70 LUFS,
+ * relatives Gate −10 LU unter dem Mittel der absolut gegateten Blöcke.
+ * Kanalgewichtung: L/R/C = 1.0 (kein LFE in dieser App). Keine Normalisierung
+ * durch die Kanalzahl — die Summe der Gewichte IST die Kanalgewichtung.
+ * Signale kürzer als 400 ms werden mit Nullen auf 400 ms aufgefüllt.
+ *
+ * True Peak: Max aus Sample-Peak und bandlimitiert (Blackman-sinc)
+ * 4×-überabgetasteten Intersample-Spitzen in Kandidaten-Regionen.
  */
 
 type BQ = { b0: number; b1: number; b2: number; a1: number; a2: number }
 
-function designHighShelf(fs: number, f0: number, gainDb: number): BQ {
-  const A = Math.pow(10, gainDb / 40)
-  const w0 = (2 * Math.PI * f0) / fs
-  const cos = Math.cos(w0)
-  const sin = Math.sin(w0)
-  const S = 1
-  const alpha = (sin / 2) * Math.sqrt((A + 1 / A) * (1 / S - 1) + 2)
-  const b0 = A * (A + 1 + (A - 1) * cos + 2 * Math.sqrt(A) * alpha)
-  const b1 = -2 * A * (A - 1 + (A + 1) * cos)
-  const b2 = A * (A + 1 + (A - 1) * cos - 2 * Math.sqrt(A) * alpha)
-  const a0 = A + 1 - (A - 1) * cos + 2 * Math.sqrt(A) * alpha
-  const a1 = 2 * (A - 1 - (A + 1) * cos)
-  const a2 = A + 1 - (A - 1) * cos - 2 * Math.sqrt(A) * alpha
-  return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
+function highShelfDeMan(fs: number, f0: number, gainDb: number, q: number): BQ {
+  const K = Math.tan((Math.PI * f0) / fs)
+  const Vh = Math.pow(10, gainDb / 20)
+  const Vb = Math.pow(Vh, 0.4996667741545416) // ITU-Spezifikation: Exponent 0.499666774155
+  const a0 = 1 + K / q + K * K
+  const b0 = (Vh + (Vb * K) / q + K * K) / a0
+  const b1 = (2 * (K * K - Vh)) / a0
+  const b2 = (Vh - (Vb * K) / q + K * K) / a0
+  const a1 = (2 * (K * K - 1)) / a0
+  const a2 = (1 - K / q + K * K) / a0
+  return { b0, b1, b2, a1, a2 }
 }
 
-function designHighpass(fs: number, f0: number): BQ {
-  const w0 = (2 * Math.PI * f0) / fs
-  const cos = Math.cos(w0)
-  const sin = Math.sin(w0)
-  const alpha = sin / (2 * 0.707)
-  const b0 = (1 + cos) / 2
-  const b1 = -(1 + cos)
-  const b2 = (1 + cos) / 2
-  const a0 = 1 + alpha
-  const a1 = -2 * cos
-  const a2 = 1 - alpha
-  return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
+function highpassDeMan(fs: number, f0: number, q: number): BQ {
+  const K = Math.tan((Math.PI * f0) / fs)
+  const norm = 1 + K / q + K * K
+  const a1 = (2 * (K * K - 1)) / norm
+  const a2 = (1 - K / q + K * K) / norm
+  return { b0: 1, b1: -2, b2: 1, a1, a2 }
 }
 
 function applyBQ(src: Float32Array, c: BQ): Float32Array {
@@ -58,24 +62,33 @@ export type LoudnessReport = {
 }
 
 export function measureLoudnessChannels(channels: Float32Array[], sampleRate: number): LoudnessReport {
-  const pre = designHighShelf(sampleRate, 1500, 4)
-  const hip = designHighpass(sampleRate, 38)
+  const pre = highShelfDeMan(sampleRate, 1681.974450955533, 3.99984385397, 0.7071752369554196)
+  const hip = highpassDeMan(sampleRate, 38.13547087602444, 0.5003270373253953)
   const gated: number[] = []
   const block = Math.max(1, Math.round(sampleRate * 0.4))
   const hop = Math.max(1, Math.round(block * 0.25))
   const weighted = channels.map((ch) => applyBQ(applyBQ(ch, pre), hip))
-  const n = channels[0]?.length ?? 0
-  const chans = channels.length || 1
+  let n = channels[0]?.length ?? 0
+  // Kürzere Signale als ein 400-ms-Block werden mit Nullen aufgefüllt
+  if (n < block) {
+    for (let c = 0; c < weighted.length; c++) {
+      const w = new Float32Array(block)
+      w.set(weighted[c])
+      weighted[c] = w
+    }
+    n = block
+  }
 
-  for (let s = 0; s + block < n; s += hop) {
+  // BS.1770: Summe der (mit 1.0 gewichteten) Kanal-Energien, KEINE Division durch Kanalzahl
+  for (let s = 0; s + block <= n; s += hop) {
     let acc = 0
-    for (let c = 0; c < chans; c++) {
+    for (let c = 0; c < channels.length; c++) {
       const d = weighted[c]
       let e = 0
       for (let i = 0; i < block; i++) e += d[s + i] * d[s + i]
-      acc += e / block
+      acc += e / block // Kanalgewicht 1.0 für L/R/C (kein LFE in dieser App)
     }
-    const mean = acc / chans
+    const mean = acc
     const lufs = -0.691 + 10 * Math.log10(mean + 1e-12)
     if (lufs > -70) gated.push(mean)
   }
@@ -99,26 +112,63 @@ export function measureLoudness(buffer: AudioBuffer): LoudnessReport {
   return measureLoudnessChannels(channels, buffer.sampleRate)
 }
 
+/** Blackman-windowed sinc interpolation (bandlimited) for true-peak estimation. */
+function sinc(x: number): number {
+  if (x === 0) return 1
+  return Math.sin(Math.PI * x) / (Math.PI * x)
+}
+
+function blackman(u: number): number {
+  const t = Math.min(1, Math.max(0, u))
+  return 0.42 - 0.5 * Math.cos(2 * Math.PI * t) + 0.08 * Math.cos(4 * Math.PI * t)
+}
+
+const TP_TAPS = 16
+
+function sincAt(src: Float32Array, pos: number): number {
+  const base = Math.floor(pos)
+  let acc = 0
+  let wsum = 0
+  for (let m = -TP_TAPS; m <= TP_TAPS; m++) {
+    const idx = base + m
+    if (idx < 0 || idx >= src.length) continue
+    const x = pos - idx
+    const w = blackman((m + TP_TAPS) / (2 * TP_TAPS)) * sinc(x)
+    acc += src[idx] * w
+    wsum += w
+  }
+  return wsum !== 0 ? acc / wsum : 0
+}
+
+/**
+ * True Peak nach BS.1770: Maximum des bandlimitierten (≈4× überabgetasteten)
+ * Signals. Zwei-Pass: Sample-Peak finden, dann nur Kandidaten innerhalb
+ * ~4 dB darunter mit Sinc-Interpolation zwischen den 3 Intersample-Positionen
+ * belegen — praktisch exakt, aber ohne volles 4×-Resampling.
+ */
 function truePeakChannels(channels: Float32Array[]): number {
-  let peak = 0
-  const n = channels[0]?.length ?? 0
+  let sampPeak = 0
   for (const d of channels) {
-    for (let i = 0; i < n - 1; i++) {
-      const a = d[i]
-      const b = d[i + 1]
-      const aa = Math.abs(a)
-      const ab = Math.abs(b)
-      if (aa > peak) peak = aa
-      if (ab > peak) peak = ab
-      const m1 = Math.abs(a * 0.75 + b * 0.25)
-      const m2 = Math.abs(a * 0.5 + b * 0.5)
-      const m3 = Math.abs(a * 0.25 + b * 0.75)
-      if (m1 > peak) peak = m1
-      if (m2 > peak) peak = m2
-      if (m3 > peak) peak = m3
+    for (let i = 0; i < d.length; i++) {
+      const a = Math.abs(d[i])
+      if (a > sampPeak) sampPeak = a
     }
   }
-  if (peak < 1e-9) return -120
+  if (sampPeak < 1e-9) return -120
+
+  let peak = sampPeak
+  const thresh = sampPeak / 1.6 // ≈ −4.1 dB unter dem Sample-Peak
+  for (const d of channels) {
+    for (let i = 0; i < d.length; i++) {
+      if (Math.abs(d[i]) < thresh) continue
+      for (const off of [-0.75, -0.5, -0.25, 0.25, 0.5, 0.75]) {
+        const p = i + off
+        if (p < 0 || p >= d.length - 1) continue
+        const v = Math.abs(sincAt(d, p))
+        if (v > peak) peak = v
+      }
+    }
+  }
   return 20 * Math.log10(peak)
 }
 

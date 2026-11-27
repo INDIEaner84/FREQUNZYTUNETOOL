@@ -3,13 +3,12 @@ import Gauge from './components/Gauge'
 import Waveform from './components/Waveform'
 import Spectrum from './components/Spectrum'
 import { type AnalysisResult } from './audio/detectPitch'
-import { type LoudnessReport } from './audio/loudness'
+import { type LoudnessReport, measureLoudnessChannels, normalizeChannels } from './audio/loudness'
 import { downloadBlob, encodeWav, formatTime, safeStem, type WavBits } from './audio/exportWav'
 import { analyzeInWorker, processInWorker, resetWorker } from './audio/workerClient'
 import { usePlayer } from './hooks/usePlayer'
 import {
   CONCERT_PRESETS,
-  CUSTOM_STORAGE_KEY,
   LAST_PLATFORM_KEY,
   LAST_TARGET_KEY,
   PLATFORM_PROFILES,
@@ -17,12 +16,20 @@ import {
   formatHz,
   hzToCents,
   loadCustomHz,
+  nearestNoteToHz,
   noteFreqAtA4,
   saveCustomHz,
+  semitoneShift,
   type PlatformId,
 } from './audio/frequencies'
+import { FORK_SETS, FORK_ATTRIBUTION } from './audio/tuningForks'
+import { renderTempoPreservedHQ } from './audio/signalsmith'
+import { ForkTone } from './audio/forkTone'
 
-type TargetMode = 'concert' | 'solfeggio'
+type TargetMode = 'concert' | 'solfeggio' | 'forks'
+type EngineMode = 'auto' | 'signalsmith' | 'vocoder'
+
+const ENGINE_STORAGE_KEY = 'frequnzy.engine'
 
 export default function App() {
   const player = usePlayer()
@@ -57,6 +64,14 @@ export default function App() {
     return (PLATFORM_PROFILES.some((p) => p.id === s) ? s : 'none') as PlatformId
   })
   const [preserveTempo, setPreserveTempo] = useState(true)
+  const [engine, setEngine] = useState<EngineMode>(() => {
+    const s = localStorage.getItem(ENGINE_STORAGE_KEY)
+    return s === 'signalsmith' || s === 'vocoder' ? s : 'auto'
+  })
+  const [usedEngine, setUsedEngine] = useState<'signalsmith' | 'vocoder' | null>(null)
+  const [forkSetId, setForkSetId] = useState<string>('solfeggio-full')
+  const [forkToneHz, setForkToneHz] = useState<number | null>(null)
+  const forkToneRef = useRef<ForkTone | null>(null)
 
   useEffect(() => {
     localStorage.setItem(LAST_TARGET_KEY, String(targetHz))
@@ -64,6 +79,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(LAST_PLATFORM_KEY, platform)
   }, [platform])
+  useEffect(() => {
+    localStorage.setItem(ENGINE_STORAGE_KEY, engine)
+  }, [engine])
+  // Klanggabel-Vorhörton beim Unmount stoppen (kein angebrochener 10-s-Ton nach Verlassen der Seite)
+  useEffect(() => () => forkToneRef.current?.stop(), [])
 
   const sourceHz = analysis?.hz ?? 440
   const ratio = useMemo(() => {
@@ -165,7 +185,21 @@ export default function App() {
   const removeCustom = (hz: number) => {
     const next = customs.filter((x) => x !== hz)
     setCustoms(next)
-    localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify(next))
+    saveCustomHz(next)
+  }
+
+  const toggleForkTone = (hz: number) => {
+    if (!forkToneRef.current) forkToneRef.current = new ForkTone(() => player.ctx())
+    const playing = forkToneRef.current.toggle(hz)
+    setForkToneHz(playing ? hz : null)
+  }
+
+  /** Klanggabel als Ziel: Note (12-TET, A4=440) so wählen, dass sie exakt auf hz liegt. */
+  const applyForkAsTarget = (hz: number) => {
+    const nn = nearestNoteToHz(hz)
+    setTargetHz(hz)
+    setSolfNote(nn.name)
+    setMode('solfeggio')
   }
 
   const playOriginal = () => {
@@ -194,11 +228,48 @@ export default function App() {
     setProcessing(true)
     setProcessProg(0)
     setResult(null)
+    setUsedEngine(null)
     player.stop()
     cancelRef.current = false
+    const profile = PLATFORM_PROFILES.find((p) => p.id === platform)!
+
+    // HQ-Pfad: Signalsmith Stretch (offline, WASM) — Fallback auf Phase Vocoder
+    if (preserveTempo && engine !== 'vocoder') {
+      try {
+        setProcessLabel('Signalsmith (HQ) rendert …')
+        setProcessProg(0.08)
+        const shifted = await renderTempoPreservedHQ(buffer, ratio, (p) => setProcessProg(0.08 + p * 0.72))
+        if (cancelRef.current) {
+          setProcessing(false)
+          return
+        }
+        let loudness = measureLoudnessChannels(shifted, buffer.sampleRate)
+        if (profile.lufs !== null && profile.truePeak !== null) {
+          setProcessLabel('Mastering')
+          setProcessProg(0.86)
+          loudness = normalizeChannels(shifted, buffer.sampleRate, profile.lufs, profile.truePeak)
+        }
+        const ctx = player.ctx()
+        const outBuf = ctx.createBuffer(buffer.numberOfChannels, shifted[0].length, buffer.sampleRate)
+        for (let c = 0; c < shifted.length; c++) outBuf.getChannelData(c).set(shifted[c])
+        setResult(outBuf)
+        setLoudRes(loudness)
+        setUsedEngine('signalsmith')
+        setProcessProg(1)
+        setProcessLabel('Fertig · Signalsmith HQ')
+        setProcessing(false)
+        return
+      } catch (e) {
+        if (cancelRef.current) {
+          setProcessing(false)
+          return
+        }
+        console.warn('Signalsmith-Rendering fehlgeschlagen, Fallback auf Phase Vocoder:', e)
+      }
+    }
+
     try {
       const ctx = player.ctx()
-      const profile = PLATFORM_PROFILES.find((p) => p.id === platform)!
       const out = await processInWorker(
         ctx,
         buffer,
@@ -214,6 +285,7 @@ export default function App() {
       if (cancelRef.current) return
       setResult(out.buffer)
       setLoudRes(out.loudness)
+      setUsedEngine(preserveTempo ? 'vocoder' : null)
       setProcessProg(1)
       setProcessLabel('Fertig')
     } catch (e) {
@@ -236,8 +308,8 @@ export default function App() {
     if (!result || !fileName) return
     const blob = encodeWav(result, wavBits)
     const plat = platform === 'none' ? '' : `_${platform}`
-    const tempo = preserveTempo ? '' : '_asetrate'
-    downloadBlob(blob, `${safeStem(fileName)}_${formatHz(targetHz, 2)}Hz${plat}${tempo}_${wavBits}bit.wav`)
+    const engineTag = preserveTempo ? (usedEngine === 'vocoder' ? '_vocoder' : '_hq') : '_asetrate'
+    downloadBlob(blob, `${safeStem(fileName)}_${formatHz(targetHz, 2)}Hz${plat}${engineTag}_${wavBits}bit.wav`)
   }
 
   useEffect(() => {
@@ -422,9 +494,12 @@ export default function App() {
             <button type="button" className={mode === 'solfeggio' ? 'on' : ''} onClick={() => setMode('solfeggio')}>
               Solfeggio
             </button>
+            <button type="button" className={mode === 'forks' ? 'on' : ''} onClick={() => setMode('forks')}>
+              Klanggabeln
+            </button>
           </div>
 
-          {mode === 'concert' ? (
+          {mode === 'concert' && (
             <div className="presets">
               {CONCERT_PRESETS.map((p) => (
                 <button
@@ -435,6 +510,7 @@ export default function App() {
                     setTargetHz(p.hz)
                     setMode('concert')
                   }}
+                  title={`${p.hz} Hz = ${hzToCents(440, p.hz) >= 0 ? '+' : ''}${hzToCents(440, p.hz).toFixed(4)} Cent vs. A4 = 440 Hz`}
                 >
                   <strong>{p.hz % 1 === 0 ? p.hz : p.hz.toFixed(2)}</strong>
                   <em>{p.name}</em>
@@ -442,7 +518,8 @@ export default function App() {
                 </button>
               ))}
             </div>
-          ) : (
+          )}
+          {mode === 'solfeggio' && (
             <div className="presets">
               {SOLFEGGIO_PRESETS.map((p) => (
                 <button
@@ -454,6 +531,7 @@ export default function App() {
                     setSolfNote(p.note)
                     setMode('solfeggio')
                   }}
+                  title={`${p.note} exakt auf ${p.hz} Hz: ${hzToCents(noteFreqAtA4(p.note, 440), p.hz) >= 0 ? '+' : ''}${hzToCents(noteFreqAtA4(p.note, 440), p.hz).toFixed(4)} Cent vs. 12-TET (A4 = 440)`}
                 >
                   <strong>{p.hz}</strong>
                   <em>
@@ -462,6 +540,86 @@ export default function App() {
                   <span>{p.desc}</span>
                 </button>
               ))}
+            </div>
+          )}
+          {mode === 'forks' && (
+            <div className="forks">
+              <div className="fork-set-row">
+                <select
+                  className="fork-select"
+                  value={forkSetId}
+                  onChange={(e) => setForkSetId(e.target.value)}
+                  aria-label="Frequenz-Set wählen"
+                >
+                  {FORK_SETS.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+                <span className="fork-count">
+                  {FORK_SETS.find((s) => s.id === forkSetId)?.entries.length ?? 0} Frequenzen
+                </span>
+              </div>
+              {FORK_SETS.filter((s) => s.id === forkSetId).map((set) => (
+                <div key={set.id}>
+                  {set.note && <p className="hint dim fork-note">{set.note}</p>}
+                  <div className="presets forks-grid">
+                    {set.entries.map((e) => {
+                      const nn = nearestNoteToHz(e.hz)
+                      const active = Math.abs(targetHz - e.hz) < 0.05
+                      const playing = forkToneHz === e.hz
+                      const hzLabel = Number.isInteger(e.hz) ? String(e.hz) : e.hz.toFixed(2)
+                      return (
+                        <div
+                          key={`${e.hz}-${e.name}`}
+                          role="button"
+                          tabIndex={0}
+                          className={`chip fork ${active ? 'active' : ''}`}
+                          onClick={() => applyForkAsTarget(e.hz)}
+                          onKeyDown={(ev) => {
+                            if (ev.key === 'Enter' || ev.key === ' ') {
+                              ev.preventDefault()
+                              applyForkAsTarget(e.hz)
+                            }
+                          }}
+                          title={`Klick: ${nn.name} exakt auf ${hzLabel} Hz ausrichten (Solfeggio-Mechanik, ${nn.cents >= 0 ? '+' : ''}${nn.cents.toFixed(2)} ct vs. 12-TET)`}
+                        >
+                          <div className="fork-head">
+                            <strong>{hzLabel}</strong>
+                            <button
+                              type="button"
+                              className={`fork-play ${playing ? 'on' : ''}`}
+                              aria-label={playing ? 'Ton stoppen' : `${hzLabel} Hz als Sinus hören`}
+                              aria-pressed={playing}
+                              onClick={(ev) => {
+                                ev.stopPropagation()
+                                toggleForkTone(e.hz)
+                              }}
+                            >
+                              {playing ? '■' : '▶'}
+                            </button>
+                          </div>
+                          <span className="fork-name">{e.name}</span>
+                          <span className="fork-meta">
+                            ≈ {nn.name} {nn.cents >= 0 ? '+' : ''}
+                            {nn.cents.toFixed(2)} ct vs. 12-TET
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
+              <p className="attr">
+                Frequenz- &amp; Namensdaten:{' '}
+                <a href={FORK_ATTRIBUTION.url} target="_blank" rel="noreferrer">
+                  {FORK_ATTRIBUTION.name}
+                </a>{' '}
+                · {FORK_ATTRIBUTION.license} © {FORK_ATTRIBUTION.year} {FORK_ATTRIBUTION.holder} · Ohne Heilversprechen —
+                die „Bedeutung“ ist Tradition, nicht Naturwissenschaft. Klick auf eine Frequenz richtet die nächstliegende
+                Note exakt darauf aus.
+              </p>
             </div>
           )}
 
@@ -516,11 +674,18 @@ export default function App() {
               <span className="k">Verhältnis</span>
               <strong>{ratio.toFixed(6)}</strong>
             </div>
-            <div>
+            <div title="1200 · log₂(Ziel ÷ Quelle) — exakter Versatz in Cent">
               <span className="k">Verschiebung</span>
               <strong>
                 {cents >= 0 ? '+' : ''}
                 {cents.toFixed(2)} ct
+              </strong>
+            </div>
+            <div title="log₂(ratio) · 12 — Halbton-Verschiebung (fraktioniert)">
+              <span className="k">In Halbtönen</span>
+              <strong>
+                {semitoneShift(sourceHz, sourceHz * ratio) >= 0 ? '+' : ''}
+                {semitoneShift(sourceHz, sourceHz * ratio).toFixed(4)} HT
               </strong>
             </div>
             <div>
@@ -577,11 +742,27 @@ export default function App() {
               Tempo halten
               <small>
                 {preserveTempo
-                  ? 'WSOLA-Pitch-Shift, Dauer bleibt gleich — Vorschau ignoriert das und ist sofort da'
-                  : 'Nur Resampling — höchste Qualität, Tempo ändert sich leicht'}
+                  ? engine === 'vocoder'
+                    ? 'Phase Vocoder (nativ, Worker): identische Dauer, tonhöhen-neutral — Vorschau ignoriert das und ist sofort da'
+                    : 'Signalsmith Stretch (HQ, MIT): simultane Pitch-/Zeit-Map statt Resample+Stretch — Dauer bleibt gleich'
+                  : 'Nur Resampling (Blackman-sinc, anti-alias) — maximal sauber, Tempo ändert sich leicht'}
               </small>
             </span>
           </label>
+          {preserveTempo && (
+            <div className="bits engine-row" role="group" aria-label="Pitch-Engine wählen">
+              <span>Engine</span>
+              <button type="button" className={engine === 'auto' ? 'on' : ''} onClick={() => setEngine('auto')} title="Signalsmith HQ, bei Fehler automatisch Phase Vocoder">
+                Auto (HQ)
+              </button>
+              <button type="button" className={engine === 'signalsmith' ? 'on' : ''} onClick={() => setEngine('signalsmith')} title="Signalsmith Stretch — Hybrid-Spektral, Pitch und Zeit simultan">
+                Signalsmith HQ
+              </button>
+              <button type="button" className={engine === 'vocoder' ? 'on' : ''} onClick={() => setEngine('vocoder')} title="Phase Vocoder im Worker — nativ, kein WASM nötig, gut für moderate Shifts">
+                Phase Vocoder
+              </button>
+            </div>
+          )}
 
           <h2>Streaming-Mastering</h2>
           <p className="hint">

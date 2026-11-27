@@ -173,3 +173,37 @@ export function loadCustomHz(): number[] {
 export function saveCustomHz(list: number[]) {
   localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify(list.slice(0, 12)))
 }
+
+/** Exact cent difference of two frequencies (fractional cents, 1200-TET). */
+export function centsBetween(fromHz: number, toHz: number): number {
+  return 1200 * Math.log2(toHz / fromHz)
+}
+
+export type NearestNote = {
+  /** e.g. "C#5" */
+  name: string
+  /** MIDI note number (may be negative for sub-Hz tones) */
+  midi: number
+  /** Signed cents of the frequency above/below the equal-tempered note */
+  cents: number
+  /** Frequency of the equal-tempered note (A4 = 440) in Hz */
+  midiHz: number
+}
+
+/**
+ * Nearest 12-TET note to an absolute frequency (A4 = 440 Hz),
+ * with the exact cents offset — the math behind Solfeggio alignment.
+ */
+export function nearestNoteToHz(hz: number, a4 = 440): NearestNote {
+  const exact = 69 + 12 * Math.log2(hz / a4)
+  const midi = Math.round(exact)
+  const name = NOTE_NAMES[((midi % 12) + 12) % 12]
+  const oct = Math.floor(midi / 12) - 1
+  const midiHz = a4 * Math.pow(2, (midi - 69) / 12)
+  return { name: `${name}${oct}`, midi, cents: (exact - midi) * 100, midiHz }
+}
+
+/** Semitones (float) between source and target — convenience for display. */
+export function semitoneShift(fromHz: number, toHz: number): number {
+  return Math.log2(toHz / fromHz) * 12
+}
