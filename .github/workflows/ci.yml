@@ -1,0 +1,39 @@
+name: CI Gate
+on:
+  push:
+    branches: [main, master, "arena/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run DSP & integration tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Security audit (high/critical)
+        run: npm audit --audit-level=high

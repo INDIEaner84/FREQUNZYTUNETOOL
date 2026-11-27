@@ -1,22 +1,39 @@
-import { formatHz } from '../audio/frequencies'
+import { formatHz, type TargetMode } from '../audio/frequencies'
 
 type Props = {
   hz: number | null
-  target: number
+  targetHz: number
+  targetA4: number
+  mode: TargetMode
+  solfNote: string
   confidence: number
   centsFrom440: number
   analyzing: boolean
 }
 
-export default function Gauge({ hz, target, confidence, centsFrom440, analyzing }: Props) {
+export default function Gauge({
+  hz,
+  targetHz,
+  targetA4,
+  mode,
+  solfNote,
+  confidence,
+  centsFrom440,
+  analyzing,
+}: Props) {
   const shown = hz ?? 440
-  const cents = hz ? 1200 * Math.log2(target / hz) : 0
+  const cents = hz && targetA4 > 0 ? 1200 * Math.log2(targetA4 / hz) : 0
   const needle = Math.max(-45, Math.min(45, cents * 1.1))
   const ring = Math.max(0, Math.min(1, confidence))
 
+  const targetText =
+    mode === 'solfeggio'
+      ? `Ziel ${solfNote} = ${formatHz(targetHz, 2)} Hz · A4 = ${formatHz(targetA4, 2)} Hz (${cents >= 0 ? '+' : ''}${cents.toFixed(1)} ct)`
+      : `Ziel ${formatHz(targetHz, 2)} Hz (${cents >= 0 ? '+' : ''}${cents.toFixed(1)} ct)`
+
   return (
     <div className="gauge">
-      <svg viewBox="0 0 280 200" className="gauge-svg" aria-hidden>
+      <svg viewBox="0 0 280 200" className="gauge-svg" aria-hidden="true">
         <defs>
           <linearGradient id="g-gold" x1="0" y1="0" x2="1" y2="1">
             <stop offset="0%" stopColor="#e8c96a" />
@@ -76,7 +93,7 @@ export default function Gauge({ hz, target, confidence, centsFrom440, analyzing 
           <circle cx="140" cy="160" r="6" fill="#e8c96a" />
         </g>
       </svg>
-      <div className="gauge-readout">
+      <div className="gauge-readout" aria-live="polite">
         <div className="hz-big">
           {analyzing ? (
             <span className="pulse">···</span>
@@ -91,7 +108,7 @@ export default function Gauge({ hz, target, confidence, centsFrom440, analyzing 
         </div>
         <div className="hz-sub">
           {hz
-            ? `${centsFrom440 >= 0 ? '+' : ''}${centsFrom440.toFixed(1)} ct zu 440 · Ziel ${formatHz(target, 2)} Hz (${cents >= 0 ? '+' : ''}${cents.toFixed(1)} ct)`
+            ? `${centsFrom440 >= 0 ? '+' : ''}${centsFrom440.toFixed(1)} ct zu 440 · ${targetText}`
             : 'Datei laden, um den Kammerton zu erkennen'}
         </div>
       </div>

@@ -9,9 +9,9 @@
   --gold-2: #e8c96a;
   --danger: #e07a5f;
   --radius: 18px;
-  --font: 'Outfit', system-ui, sans-serif;
-  --serif: 'Cormorant Garamond', Georgia, serif;
-  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --font: 'Outfit', 'Avenir Next', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --serif: 'Cormorant Garamond', 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  --mono: 'IBM Plex Mono', 'SF Mono', 'JetBrains Mono', ui-monospace, 'Cascadia Mono', monospace;
 }
 
 * {
@@ -321,13 +321,33 @@ h1 {
 .chip.mini {
   flex-direction: row;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
+  gap: 4px;
+  padding: 4px 8px 4px 10px;
   width: auto;
+  cursor: default;
+}
+.chip.mini .mini-select {
+  background: transparent;
+  border: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 2px;
+  cursor: pointer;
 }
 .chip.mini .x {
+  background: transparent;
+  border: 0;
   color: var(--muted);
-  padding-left: 4px;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.chip.mini .x:hover,
+.chip.mini .x:focus-visible {
+  color: var(--ink);
 }
 
 .custom-row {
@@ -584,6 +604,9 @@ label.ghost.sm {
   color: var(--muted);
   border-color: var(--line);
   background: #101118;
+}
+.stale-note {
+  margin-top: 12px;
 }
 .bits {
   display: flex;
