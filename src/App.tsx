@@ -4,100 +4,131 @@ import Waveform from './components/Waveform'
 import Spectrum from './components/Spectrum'
 import { type AnalysisResult } from './audio/detectPitch'
 import { type LoudnessReport } from './audio/loudness'
-import { downloadBlob, encodeWav, formatTime, safeStem, type WavBits } from './audio/exportWav'
-import { analyzeInWorker, processInWorker, resetWorker } from './audio/workerClient'
+import { downloadBlob, formatTime, safeStem, type WavBits } from './audio/exportWav'
+import { analyzeInWorker, encodeWavInWorker, isAbortError, processInWorker, resetWorker } from './audio/workerClient'
 import { usePlayer } from './hooks/usePlayer'
 import {
   CONCERT_PRESETS,
-  CUSTOM_STORAGE_KEY,
-  LAST_PLATFORM_KEY,
-  LAST_TARGET_KEY,
   PLATFORM_PROFILES,
   SOLFEGGIO_PRESETS,
+  computePitchRatio,
   formatHz,
   hzToCents,
   loadCustomHz,
-  noteFreqAtA4,
+  loadPlatform,
+  loadTargetSettings,
   saveCustomHz,
+  savePlatform,
+  saveTargetSettings,
   type PlatformId,
+  type TargetMode,
 } from './audio/frequencies'
 
-type TargetMode = 'concert' | 'solfeggio'
+const ACCEPTED_AUDIO = 'audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.aiff'
+
+type RenderedOutput = {
+  buffer: AudioBuffer
+  loudness: LoudnessReport
+  fileName: string
+  targetHz: number
+  mode: TargetMode
+  solfNote: string
+  preserveTempo: boolean
+  platform: PlatformId
+}
 
 export default function App() {
   const player = usePlayer()
   const [fileName, setFileName] = useState<string | null>(null)
   const [buffer, setBuffer] = useState<AudioBuffer | null>(null)
-  const [result, setResult] = useState<AudioBuffer | null>(null)
+  const [rendered, setRendered] = useState<RenderedOutput | null>(null)
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
   const [loudOrig, setLoudOrig] = useState<LoudnessReport | null>(null)
-  const [loudRes, setLoudRes] = useState<LoudnessReport | null>(null)
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeProg, setAnalyzeProg] = useState(0)
   const [processing, setProcessing] = useState(false)
   const [processProg, setProcessProg] = useState(0)
   const [processLabel, setProcessLabel] = useState('')
+  const [exporting, setExporting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [drag, setDrag] = useState(false)
   const [wavBits, setWavBits] = useState<WavBits>(24)
   const [helpOpen, setHelpOpen] = useState(false)
-  const cancelRef = useRef(false)
+  const sessionRef = useRef(0)
 
-  const [targetHz, setTargetHz] = useState(() => {
-    const s = localStorage.getItem(LAST_TARGET_KEY)
-    const n = s ? parseFloat(s) : 432
-    return Number.isFinite(n) ? n : 432
-  })
-  const [mode, setMode] = useState<TargetMode>('concert')
-  const [solfNote, setSolfNote] = useState('C5')
+  const initialTarget = useMemo(() => loadTargetSettings(), [])
+  const [targetHz, setTargetHz] = useState<number>(initialTarget.targetHz)
+  const [mode, setMode] = useState<TargetMode>(initialTarget.mode)
+  const [solfNote, setSolfNote] = useState<string>(initialTarget.solfNote)
   const [customInput, setCustomInput] = useState('')
   const [customs, setCustoms] = useState<number[]>(() => loadCustomHz())
-  const [platform, setPlatform] = useState<PlatformId>(() => {
-    const s = localStorage.getItem(LAST_PLATFORM_KEY)
-    return (PLATFORM_PROFILES.some((p) => p.id === s) ? s : 'none') as PlatformId
-  })
+  const [platform, setPlatform] = useState<PlatformId>(() => loadPlatform())
   const [preserveTempo, setPreserveTempo] = useState(true)
 
   useEffect(() => {
-    localStorage.setItem(LAST_TARGET_KEY, String(targetHz))
-  }, [targetHz])
+    saveTargetSettings(targetHz, mode, solfNote)
+  }, [targetHz, mode, solfNote])
+
   useEffect(() => {
-    localStorage.setItem(LAST_PLATFORM_KEY, platform)
+    savePlatform(platform)
   }, [platform])
 
   const sourceHz = analysis?.hz ?? 440
-  const ratio = useMemo(() => {
-    if (mode === 'solfeggio') return targetHz / noteFreqAtA4(solfNote, sourceHz)
-    return targetHz / sourceHz
-  }, [mode, solfNote, targetHz, sourceHz])
-
-  const cents = hzToCents(sourceHz, sourceHz * ratio)
+  const ratio = useMemo(
+    () => computePitchRatio(sourceHz, targetHz, mode, solfNote),
+    [sourceHz, targetHz, mode, solfNote],
+  )
+  const effectiveTargetA4 = sourceHz * ratio
+  const cents = hzToCents(sourceHz, effectiveTargetA4)
   const alreadyTuned = !!analysis && Math.abs(cents) < 4
   const longFile = (buffer?.duration ?? 0) > 8 * 60
 
-  const runAnalysis = useCallback(async (decoded: AudioBuffer, name: string) => {
-    setError(null)
-    setResult(null)
-    setLoudRes(null)
-    setAnalysis(null)
-    setLoudOrig(null)
-    player.stop()
-    setFileName(name)
-    setBuffer(decoded)
-    setAnalyzing(true)
-    setAnalyzeProg(0)
-    try {
-      const { analysis: tuning, loudness } = await analyzeInWorker(decoded, (p) => setAnalyzeProg(p))
-      setAnalysis(tuning)
-      setLoudOrig(loudness)
-    } catch (e) {
-      console.error(e)
-      setError('Datei konnte nicht analysiert werden.')
-    } finally {
-      setAnalyzing(false)
-      setAnalyzeProg(1)
-    }
-  }, [player])
+  const result = rendered?.buffer ?? null
+  const loudRes = rendered?.loudness ?? null
+  const resultStale =
+    !!rendered &&
+    (Math.abs(rendered.targetHz - targetHz) > 1e-4 ||
+      rendered.mode !== mode ||
+      (mode === 'solfeggio' && rendered.solfNote !== solfNote) ||
+      rendered.preserveTempo !== preserveTempo ||
+      rendered.platform !== platform)
+
+  const runAnalysis = useCallback(
+    async (decoded: AudioBuffer, name: string) => {
+      const token = ++sessionRef.current
+      resetWorker()
+      setProcessing(false)
+      setExporting(false)
+      setProcessLabel('')
+      setError(null)
+      setRendered(null)
+      setAnalysis(null)
+      setLoudOrig(null)
+      player.stop()
+      setFileName(name)
+      setBuffer(decoded)
+      setAnalyzing(true)
+      setAnalyzeProg(0)
+      try {
+        const { analysis: tuning, loudness } = await analyzeInWorker(decoded, (p) => {
+          if (sessionRef.current === token) setAnalyzeProg(p)
+        })
+        if (sessionRef.current !== token) return
+        setAnalysis(tuning)
+        setLoudOrig(loudness)
+      } catch (e) {
+        if (isAbortError(e) || sessionRef.current !== token) return
+        console.error(e)
+        setError('Datei konnte nicht analysiert werden.')
+      } finally {
+        if (sessionRef.current === token) {
+          setAnalyzing(false)
+          setAnalyzeProg(1)
+        }
+      }
+    },
+    [player],
+  )
 
   const loadFile = useCallback(
     async (file: File) => {
@@ -165,112 +196,158 @@ export default function App() {
   const removeCustom = (hz: number) => {
     const next = customs.filter((x) => x !== hz)
     setCustoms(next)
-    localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify(next))
+    saveCustomHz(next)
   }
 
-  const playOriginal = () => {
-    if (!buffer) return
+  const playOriginal = useCallback(() => {
+    if (!buffer || analyzing) return
     void player.play(buffer, 'original', 1, player.frac())
-  }
-  const playPreview = () => {
-    if (!buffer) return
+  }, [buffer, analyzing, player])
+
+  const playPreview = useCallback(() => {
+    if (!buffer || analyzing) return
     void player.play(buffer, 'preview', ratio, player.frac())
-  }
-  const playResult = () => {
+  }, [buffer, analyzing, player, ratio])
+
+  const playResult = useCallback(() => {
     if (!result) return
     void player.play(result, 'result', 1, player.frac())
-  }
+  }, [result, player])
 
-  const onSeek = (frac: number) => {
-    player.seek(frac)
-    if (player.playing === 'original' && buffer) void player.play(buffer, 'original', 1, frac)
-    else if (player.playing === 'preview' && buffer) void player.play(buffer, 'preview', ratio, frac)
-    else if (player.playing === 'result' && result) void player.play(result, 'result', 1, frac)
-  }
+  const onSeek = useCallback(
+    (frac: number) => {
+      player.seek(frac)
+      if (player.playing === 'original' && buffer) void player.play(buffer, 'original', 1, frac)
+      else if (player.playing === 'preview' && buffer) void player.play(buffer, 'preview', ratio, frac)
+      else if (player.playing === 'result' && result) void player.play(result, 'result', 1, frac)
+    },
+    [player, buffer, ratio, result],
+  )
 
   const convert = async () => {
-    if (!buffer || !analysis) return
+    if (!buffer || !analysis || !fileName) return
+    const token = sessionRef.current
+    const snap = {
+      fileName,
+      targetHz,
+      mode,
+      solfNote,
+      preserveTempo,
+      platform,
+    }
     setError(null)
     setProcessing(true)
     setProcessProg(0)
-    setResult(null)
+    setProcessLabel('Starte …')
+    setRendered(null)
     player.stop()
-    cancelRef.current = false
+
     try {
       const ctx = player.ctx()
-      const profile = PLATFORM_PROFILES.find((p) => p.id === platform)!
+      const profile = PLATFORM_PROFILES.find((p) => p.id === snap.platform)!
       const out = await processInWorker(
         ctx,
         buffer,
         ratio,
-        preserveTempo,
+        snap.preserveTempo,
         profile.lufs,
         profile.truePeak,
         (p, label) => {
-          setProcessProg(p)
-          setProcessLabel(label)
+          if (sessionRef.current === token) {
+            setProcessProg(p)
+            setProcessLabel(label)
+          }
         },
       )
-      if (cancelRef.current) return
-      setResult(out.buffer)
-      setLoudRes(out.loudness)
+      if (sessionRef.current !== token) return
+      setRendered({
+        buffer: out.buffer,
+        loudness: out.loudness,
+        ...snap,
+      })
       setProcessProg(1)
       setProcessLabel('Fertig')
     } catch (e) {
-      if (cancelRef.current) return
+      if (isAbortError(e) || sessionRef.current !== token) return
       console.error(e)
       setError('Umwandlung fehlgeschlagen. Versuche „Tempo nicht halten“ oder eine kürzere Datei.')
     } finally {
-      setProcessing(false)
+      if (sessionRef.current === token) {
+        setProcessing(false)
+      }
     }
   }
 
   const cancelProcess = () => {
-    cancelRef.current = true
     resetWorker()
     setProcessing(false)
     setProcessLabel('Abgebrochen')
   }
 
-  const download = () => {
-    if (!result || !fileName) return
-    const blob = encodeWav(result, wavBits)
-    const plat = platform === 'none' ? '' : `_${platform}`
-    const tempo = preserveTempo ? '' : '_asetrate'
-    downloadBlob(blob, `${safeStem(fileName)}_${formatHz(targetHz, 2)}Hz${plat}${tempo}_${wavBits}bit.wav`)
+  const download = async () => {
+    if (!rendered || exporting) return
+    setError(null)
+    setExporting(true)
+    try {
+      const blob = await encodeWavInWorker(rendered.buffer, wavBits)
+      const noteTag = rendered.mode === 'solfeggio' ? `${rendered.solfNote}_` : ''
+      const plat = rendered.platform === 'none' ? '' : `_${rendered.platform}`
+      const tempo = rendered.preserveTempo ? '' : '_asetrate'
+      const outName = `${safeStem(rendered.fileName)}_${noteTag}${formatHz(rendered.targetHz, 2)}Hz${plat}${tempo}_${wavBits}bit.wav`
+      downloadBlob(blob, outName)
+    } catch (e) {
+      if (isAbortError(e)) return
+      console.error(e)
+      setError(e instanceof Error ? e.message : 'WAV-Export fehlgeschlagen.')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const keyActionRef = useRef<(e: KeyboardEvent) => void>(() => {})
+  keyActionRef.current = (e: KeyboardEvent) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return
+    const target = e.target as HTMLElement | null
+    const tag = target?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable) return
+
+    if (e.code === 'Space') {
+      if (tag === 'BUTTON' || tag === 'A') return
+      e.preventDefault()
+      if (player.playing) player.pause()
+      else if (result) playResult()
+      else if (buffer && !analyzing) playOriginal()
+    } else if (e.key === '1' || e.key === 'a' || e.key === 'A') {
+      playOriginal()
+    } else if (e.key === '2' || e.key === 'v' || e.key === 'V') {
+      playPreview()
+    } else if (e.key === '3' || e.key === 'b' || e.key === 'B') {
+      playResult()
+    } else if (e.key === 'l' || e.key === 'L') {
+      player.toggleLoop()
+    } else if (e.key === 'ArrowLeft') {
+      onSeek(Math.max(0, player.frac() - 0.05))
+    } else if (e.key === 'ArrowRight') {
+      onSeek(Math.min(1, player.frac() + 0.05))
+    }
   }
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
-      if (e.code === 'Space') {
-        e.preventDefault()
-        if (player.playing) player.pause()
-        else if (result) playResult()
-        else if (buffer) playOriginal()
-      } else if (e.key === '1' || e.key === 'a' || e.key === 'A') playOriginal()
-      else if (e.key === '2' || e.key === 'v' || e.key === 'V') playPreview()
-      else if (e.key === '3' || e.key === 'b' || e.key === 'B') playResult()
-      else if (e.key === 'l' || e.key === 'L') player.toggleLoop()
-      else if (e.key === 'ArrowLeft') onSeek(Math.max(0, player.frac() - 0.05))
-      else if (e.key === 'ArrowRight') onSeek(Math.min(1, player.frac() + 0.05))
-    }
+    const onKey = (e: KeyboardEvent) => keyActionRef.current(e)
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  })
+  }, [])
 
   const profile = PLATFORM_PROFILES.find((p) => p.id === platform)!
   const waveBuf = player.playing === 'result' && result ? result : buffer
-  const now =
-    (waveBuf ? player.progress * waveBuf.duration : 0)
+  const now = waveBuf ? player.progress * waveBuf.duration : 0
 
   return (
     <div className="app">
-      <div className="grain" aria-hidden />
+      <div className="grain" aria-hidden="true" />
       <header className="top">
         <div className="brand">
-          <div className="mark" aria-hidden>
+          <div className="mark" aria-hidden="true">
             <span />
             <span />
             <span />
@@ -280,7 +357,12 @@ export default function App() {
             <p className="tag">Kammerton erkennen · umstimmen · plattformfertig mastern</p>
           </div>
         </div>
-        <button className="ghost" type="button" onClick={() => setHelpOpen((v) => !v)}>
+        <button
+          className="ghost"
+          type="button"
+          aria-expanded={helpOpen}
+          onClick={() => setHelpOpen((v) => !v)}
+        >
           {helpOpen ? 'Schließen' : 'So funktioniert’s'}
         </button>
       </header>
@@ -308,9 +390,12 @@ export default function App() {
           className={`stage ${drag ? 'dragging' : ''} ${buffer ? 'has-file' : ''}`}
           onDragOver={(e) => {
             e.preventDefault()
-            setDrag(true)
+            if (!drag) setDrag(true)
           }}
-          onDragLeave={() => setDrag(false)}
+          onDragLeave={(e) => {
+            if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+            setDrag(false)
+          }}
           onDrop={onDrop}
         >
           {!buffer ? (
@@ -318,9 +403,10 @@ export default function App() {
               <label className="drop-hit">
                 <input
                   type="file"
-                  accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.aiff"
+                  accept={ACCEPTED_AUDIO}
                   onChange={(e) => {
-                    const f = e.target.files?.[0]
+                    const f = e.currentTarget.files?.[0]
+                    e.currentTarget.value = ''
                     if (f) void loadFile(f)
                   }}
                 />
@@ -349,10 +435,11 @@ export default function App() {
                   Andere Datei
                   <input
                     type="file"
-                    accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aac"
+                    accept={ACCEPTED_AUDIO}
                     hidden
                     onChange={(e) => {
-                      const f = e.target.files?.[0]
+                      const f = e.currentTarget.files?.[0]
+                      e.currentTarget.value = ''
                       if (f) void loadFile(f)
                     }}
                   />
@@ -360,7 +447,10 @@ export default function App() {
               </div>
               <Gauge
                 hz={analysis?.hz ?? null}
-                target={targetHz}
+                targetHz={targetHz}
+                targetA4={effectiveTargetA4}
+                mode={mode}
+                solfNote={solfNote}
                 confidence={analysis?.confidence ?? 0}
                 centsFrom440={analysis?.centsFrom440 ?? 0}
                 analyzing={analyzing}
@@ -372,7 +462,7 @@ export default function App() {
                 <div className="badge warn">Lange Datei: Umwandeln läuft im Hintergrund, Vorschau ist sofort hörbar</div>
               )}
               <Waveform buffer={waveBuf} progress={player.progress} onSeek={onSeek} />
-              <Spectrum analyser={player.analyserRef.current} active={player.playing !== null} />
+              <Spectrum analyserRef={player.analyserRef} active={player.playing !== null} />
               <div className="transport">
                 <span className="time">
                   {formatTime(now)} / {formatTime(waveBuf?.duration ?? 0)}
@@ -389,7 +479,12 @@ export default function App() {
                 <button type="button" className="ghost sm" disabled={!player.playing} onClick={player.pause}>
                   Pause
                 </button>
-                <button type="button" className={`ghost sm ${player.loop ? 'on' : ''}`} onClick={player.toggleLoop}>
+                <button
+                  type="button"
+                  aria-pressed={player.loop}
+                  className={`ghost sm ${player.loop ? 'on' : ''}`}
+                  onClick={player.toggleLoop}
+                >
                   Loop
                 </button>
                 <label className="vol">
@@ -405,7 +500,7 @@ export default function App() {
                 </label>
               </div>
               {analyzing && (
-                <div className="prog">
+                <div className="prog" role="status">
                   <div style={{ width: `${analyzeProg * 100}%` }} />
                   <span>Kammerton wird ermittelt …</span>
                 </div>
@@ -415,11 +510,32 @@ export default function App() {
         </section>
 
         <section className="panel">
-          <div className="tabs">
-            <button type="button" className={mode === 'concert' ? 'on' : ''} onClick={() => setMode('concert')}>
+          <div className="tabs" role="tablist" aria-label="Zielstimmungs-Modus">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'concert'}
+              className={mode === 'concert' ? 'on' : ''}
+              onClick={() => setMode('concert')}
+            >
               Kammerton A4
             </button>
-            <button type="button" className={mode === 'solfeggio' ? 'on' : ''} onClick={() => setMode('solfeggio')}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'solfeggio'}
+              className={mode === 'solfeggio' ? 'on' : ''}
+              onClick={() => {
+                const match = SOLFEGGIO_PRESETS.find((p) => Math.abs(p.hz - targetHz) < 0.05)
+                if (!match) {
+                  setTargetHz(528)
+                  setSolfNote('C5')
+                } else {
+                  setSolfNote(match.note)
+                }
+                setMode('solfeggio')
+              }}
+            >
               Solfeggio
             </button>
           </div>
@@ -487,26 +603,29 @@ export default function App() {
           {customs.length > 0 && (
             <div className="custom-list">
               {customs.map((hz) => (
-                <button
+                <div
                   key={hz}
-                  type="button"
-                  className={`chip mini ${Math.abs(targetHz - hz) < 0.01 ? 'active' : ''}`}
-                  onClick={() => {
-                    setTargetHz(hz)
-                    setMode('concert')
-                  }}
+                  className={`chip mini ${mode === 'concert' && Math.abs(targetHz - hz) < 0.01 ? 'active' : ''}`}
                 >
-                  {formatHz(hz, 2)} Hz
-                  <span
-                    className="x"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      removeCustom(hz)
+                  <button
+                    type="button"
+                    className="mini-select"
+                    onClick={() => {
+                      setTargetHz(hz)
+                      setMode('concert')
                     }}
                   >
+                    {formatHz(hz, 2)} Hz
+                  </button>
+                  <button
+                    type="button"
+                    className="x"
+                    aria-label={`Frequenz ${formatHz(hz, 2)} Hz entfernen`}
+                    onClick={() => removeCustom(hz)}
+                  >
                     ×
-                  </span>
-                </button>
+                  </button>
+                </div>
               ))}
             </div>
           )}
@@ -603,7 +722,17 @@ export default function App() {
           </div>
           <p className="hint dim">{profile.hint}</p>
 
-          {error && <div className="err">{error}</div>}
+          {error && (
+            <div className="err" role="alert">
+              {error}
+            </div>
+          )}
+
+          {resultStale && !processing && (
+            <div className="badge warn stale-note">
+              Einstellungen geändert — für aktualisiertes Ergebnis erneut „Umwandeln“ wählen
+            </div>
+          )}
 
           <div className="actions">
             <button
@@ -619,8 +748,13 @@ export default function App() {
                 Abbrechen
               </button>
             )}
-            <button type="button" className="gold" disabled={!result} onClick={download}>
-              WAV {wavBits}-bit
+            <button
+              type="button"
+              className="gold"
+              disabled={!rendered || exporting}
+              onClick={() => void download()}
+            >
+              {exporting ? 'Exportiere …' : `WAV ${wavBits}-bit`}
             </button>
           </div>
           <div className="bits">
@@ -634,7 +768,7 @@ export default function App() {
           </div>
 
           {processing && (
-            <div className="prog">
+            <div className="prog" role="status">
               <div style={{ width: `${processProg * 100}%` }} />
               <span>
                 {processLabel} · {Math.round(processProg * 100)} %
@@ -642,7 +776,7 @@ export default function App() {
             </div>
           )}
 
-          {loudRes && result && (
+          {loudRes && rendered && (
             <div className="report">
               <div>
                 <span className="k">Ergebnis LUFS</span>
@@ -654,7 +788,15 @@ export default function App() {
               </div>
               <div>
                 <span className="k">Dauer</span>
-                <strong>{formatTime(result.duration)}</strong>
+                <strong>{formatTime(rendered.buffer.duration)}</strong>
+              </div>
+              <div>
+                <span className="k">Gerendertes Ziel</span>
+                <strong>
+                  {rendered.mode === 'solfeggio'
+                    ? `${rendered.solfNote} = ${formatHz(rendered.targetHz, 2)} Hz`
+                    : `${formatHz(rendered.targetHz, 2)} Hz`}
+                </strong>
               </div>
             </div>
           )}

@@ -1,6 +1,8 @@
 export type WavBits = 16 | 24
 
-function writeStr(view: DataView, offset: number, s: string) {
+const MAX_RIFF_BYTES = 0xffffffff
+
+function writeStr(view: DataView, offset: number, s: string): void {
   for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i))
 }
 
@@ -14,14 +16,32 @@ function clampSample(s: number): number {
   return s
 }
 
-export function encodeWav(buffer: AudioBuffer, bits: WavBits = 24): Blob {
-  const numCh = buffer.numberOfChannels
-  const sr = buffer.sampleRate
-  const len = buffer.length
+/**
+ * Pure PCM RIFF/WAVE encoder (16-bit with TPDF dither or 24-bit linear PCM).
+ * Runs identically in browser main thread, Web Workers, and Node.js tests.
+ */
+export function encodeWavBytes(
+  channels: Float32Array[],
+  sampleRate: number,
+  bits: WavBits = 24,
+): ArrayBuffer {
+  const numCh = channels.length
+  if (numCh < 1 || numCh > 32) {
+    throw new RangeError(`Ungültige Kanalanzahl für WAV-Export: ${numCh}`)
+  }
+  const sr = Math.round(sampleRate)
+  if (!Number.isFinite(sr) || sr < 1) {
+    throw new RangeError(`Ungültige Abtastrate für WAV-Export: ${sampleRate}`)
+  }
+  const len = channels[0]?.length ?? 0
   const bytesPerSample = bits === 24 ? 3 : 2
   const blockAlign = numCh * bytesPerSample
   const dataSize = len * blockAlign
   const header = 44
+  if (header + dataSize > MAX_RIFF_BYTES) {
+    throw new RangeError('Audiodatei überschreitet das 4-GB-Limit des WAV-Formats.')
+  }
+
   const out = new ArrayBuffer(header + dataSize)
   const view = new DataView(out)
 
@@ -39,13 +59,12 @@ export function encodeWav(buffer: AudioBuffer, bits: WavBits = 24): Blob {
   writeStr(view, 36, 'data')
   view.setUint32(40, dataSize, true)
 
-  const chans = [...Array(numCh)].map((_, c) => buffer.getChannelData(c))
   let o = 44
   if (bits === 16) {
     const max = 32767
     for (let i = 0; i < len; i++) {
       for (let c = 0; c < numCh; c++) {
-        const s = clampSample(chans[c][i])
+        const s = clampSample(channels[c][i] ?? 0)
         let v = Math.round(s * max + tpdf())
         if (v > max) v = max
         if (v < -32768) v = -32768
@@ -57,8 +76,8 @@ export function encodeWav(buffer: AudioBuffer, bits: WavBits = 24): Blob {
     const max = 8388607
     for (let i = 0; i < len; i++) {
       for (let c = 0; c < numCh; c++) {
-        const s = clampSample(chans[c][i])
-        let v = Math.round(s * max + tpdf())
+        const s = clampSample(channels[c][i] ?? 0)
+        let v = Math.round(s * max)
         if (v > max) v = max
         if (v < -8388608) v = -8388608
         view.setUint8(o, v & 0xff)
@@ -68,19 +87,27 @@ export function encodeWav(buffer: AudioBuffer, bits: WavBits = 24): Blob {
       }
     }
   }
-  return new Blob([out], { type: 'audio/wav' })
+  return out
 }
 
-export function encodeWav16(buffer: AudioBuffer): Blob {
-  return encodeWav(buffer, 16)
+export function encodeWav(buffer: AudioBuffer, bits: WavBits = 24): Blob {
+  const chans: Float32Array[] = []
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    chans.push(buffer.getChannelData(c))
+  }
+  const bytes = encodeWavBytes(chans, buffer.sampleRate, bits)
+  return new Blob([bytes], { type: 'audio/wav' })
 }
 
-export function downloadBlob(blob: Blob, filename: string) {
+export function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = filename
+  a.style.display = 'none'
+  document.body.appendChild(a)
   a.click()
+  a.remove()
   setTimeout(() => URL.revokeObjectURL(url), 4000)
 }
 

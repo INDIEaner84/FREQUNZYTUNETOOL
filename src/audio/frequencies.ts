@@ -1,3 +1,5 @@
+export type TargetMode = 'concert' | 'solfeggio'
+
 export type PitchPreset = {
   hz: number
   name: string
@@ -109,25 +111,51 @@ export const PLATFORM_PROFILES: PlatformProfile[] = [
   },
 ]
 
-const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-export function midiToNoteName(midi: number): string {
-  const n = Math.round(midi)
-  const name = NOTE_NAMES[((n % 12) + 12) % 12]
-  const oct = Math.floor(n / 12) - 1
-  return `${name}${oct}`
+const SEMITONE_BY_NOTE: Record<string, number> = {
+  C: 0,
+  'C#': 1,
+  Db: 1,
+  D: 2,
+  'D#': 3,
+  Eb: 3,
+  E: 4,
+  F: 5,
+  'F#': 6,
+  Gb: 6,
+  G: 7,
+  'G#': 8,
+  Ab: 8,
+  A: 9,
+  'A#': 10,
+  Bb: 10,
+  B: 11,
 }
 
-/** Equal-tempered frequency of a named note at a given A4. */
+/** Equal-tempered frequency of a named note (e.g. 'C5', 'F#5', 'Bb4') at a given A4. */
 export function noteFreqAtA4(noteName: string, a4: number): number {
-  const match = noteName.match(/^([A-G]#?)(-?\d+)$/)
+  const match = noteName.trim().match(/^([A-G](?:#|b)?)(-?\d+)$/)
   if (!match) return a4
-  const name = match[1]
+  const idx = SEMITONE_BY_NOTE[match[1]]
+  if (idx === undefined) return a4
   const oct = parseInt(match[2], 10)
-  const idx = NOTE_NAMES.indexOf(name)
   const midi = (oct + 1) * 12 + idx
   const a4midi = 69
   return a4 * Math.pow(2, (midi - a4midi) / 12)
+}
+
+export function computePitchRatio(
+  sourceA4: number,
+  targetHz: number,
+  mode: TargetMode,
+  solfNote: string,
+): number {
+  if (!Number.isFinite(sourceA4) || sourceA4 <= 0 || !Number.isFinite(targetHz) || targetHz <= 0) {
+    return 1
+  }
+  if (mode === 'solfeggio') {
+    return targetHz / noteFreqAtA4(solfNote, sourceA4)
+  }
+  return targetHz / sourceA4
 }
 
 export function hzToCents(from: number, to: number): number {
@@ -140,7 +168,7 @@ export function formatHz(hz: number, digits = 2): string {
   return hz.toFixed(digits)
 }
 
-export function nearestPreset(hz: number): PitchPreset | null {
+export function nearestPreset(hz: number, maxDiffHz = 1.5): PitchPreset | null {
   let best: PitchPreset | null = null
   let bestAbs = Infinity
   for (const p of CONCERT_PRESETS) {
@@ -150,26 +178,89 @@ export function nearestPreset(hz: number): PitchPreset | null {
       best = p
     }
   }
-  if (best && bestAbs <= 1.5) return best
+  if (best && bestAbs <= maxDiffHz) return best
   return null
+}
+
+export function exactPreset(hz: number): PitchPreset | null {
+  return nearestPreset(hz, 0.05)
 }
 
 export const CUSTOM_STORAGE_KEY = 'frequnzy.customHz'
 export const LAST_TARGET_KEY = 'frequnzy.lastTarget'
+export const LAST_MODE_KEY = 'frequnzy.lastMode'
+export const LAST_SOLF_NOTE_KEY = 'frequnzy.lastSolfNote'
 export const LAST_PLATFORM_KEY = 'frequnzy.lastPlatform'
+
+function safeGetItem(key: string): string | null {
+  try {
+    if (typeof localStorage === 'undefined') return null
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function safeSetItem(key: string, value: string): void {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem(key, value)
+  } catch {
+    /* private mode / quota / sandboxed iframe */
+  }
+}
 
 export function loadCustomHz(): number[] {
   try {
-    const raw = localStorage.getItem(CUSTOM_STORAGE_KEY)
+    const raw = safeGetItem(CUSTOM_STORAGE_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw) as unknown
     if (!Array.isArray(parsed)) return []
-    return parsed.filter((n): n is number => typeof n === 'number' && n > 20 && n < 20000)
+    return parsed.filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 20 && n <= 20000)
   } catch {
     return []
   }
 }
 
-export function saveCustomHz(list: number[]) {
-  localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify(list.slice(0, 12)))
+export function saveCustomHz(list: number[]): void {
+  safeSetItem(CUSTOM_STORAGE_KEY, JSON.stringify(list.slice(0, 12)))
+}
+
+export type PersistedTarget = {
+  targetHz: number
+  mode: TargetMode
+  solfNote: string
+}
+
+export function loadTargetSettings(): PersistedTarget {
+  const rawHz = safeGetItem(LAST_TARGET_KEY)
+  const parsedHz = rawHz ? parseFloat(rawHz) : 432
+  const targetHz = Number.isFinite(parsedHz) && parsedHz >= 20 && parsedHz <= 20000 ? parsedHz : 432
+
+  const rawMode = safeGetItem(LAST_MODE_KEY)
+  const mode: TargetMode = rawMode === 'solfeggio' ? 'solfeggio' : 'concert'
+
+  const rawNote = safeGetItem(LAST_SOLF_NOTE_KEY)
+  const matchingSolf = SOLFEGGIO_PRESETS.find((p) => Math.abs(p.hz - targetHz) < 0.05)
+  const solfNote =
+    rawNote && /^([A-G](?:#|b)?)(-?\d+)$/.test(rawNote)
+      ? rawNote
+      : matchingSolf?.note ?? 'C5'
+
+  return { targetHz, mode, solfNote }
+}
+
+export function saveTargetSettings(targetHz: number, mode: TargetMode, solfNote: string): void {
+  safeSetItem(LAST_TARGET_KEY, String(targetHz))
+  safeSetItem(LAST_MODE_KEY, mode)
+  safeSetItem(LAST_SOLF_NOTE_KEY, solfNote)
+}
+
+export function loadPlatform(): PlatformId {
+  const s = safeGetItem(LAST_PLATFORM_KEY)
+  return (PLATFORM_PROFILES.some((p) => p.id === s) ? s : 'none') as PlatformId
+}
+
+export function savePlatform(platform: PlatformId): void {
+  safeSetItem(LAST_PLATFORM_KEY, platform)
 }

@@ -1,8 +1,9 @@
 /// <reference lib="webworker" />
 
 import { detectConcertPitchFromChannels } from './detectPitch'
-import { pitchShiftChannels } from './pitchShift'
+import { encodeWavBytes, type WavBits } from './exportWav'
 import { measureLoudnessChannels, normalizeChannels } from './loudness'
+import { pitchShiftChannels } from './pitchShift'
 
 type AnalyzeMsg = {
   type: 'analyze'
@@ -22,7 +23,15 @@ type ProcessMsg = {
   truePeak: number | null
 }
 
-type InMsg = AnalyzeMsg | ProcessMsg
+type EncodeWavMsg = {
+  type: 'encodeWav'
+  id: number
+  sampleRate: number
+  channels: Float32Array[]
+  bits: WavBits
+}
+
+type InMsg = AnalyzeMsg | ProcessMsg | EncodeWavMsg
 
 self.onmessage = async (ev: MessageEvent<InMsg>) => {
   const msg = ev.data
@@ -56,6 +65,12 @@ self.onmessage = async (ev: MessageEvent<InMsg>) => {
         { type: 'processed', id: msg.id, channels: shifted, sampleRate: msg.sampleRate, loudness },
         shifted.map((c) => c.buffer),
       )
+      return
+    }
+
+    if (msg.type === 'encodeWav') {
+      const wavBytes = encodeWavBytes(msg.channels, msg.sampleRate, msg.bits)
+      postMessage({ type: 'wav', id: msg.id, wavBytes }, [wavBytes])
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

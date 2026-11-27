@@ -1,12 +1,13 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type RefObject } from 'react'
 
 type Props = {
-  analyser: AnalyserNode | null
+  analyserRef: RefObject<AnalyserNode | null>
   active: boolean
 }
 
-export default function Spectrum({ analyser, active }: Props) {
+export default function Spectrum({ analyserRef, active }: Props) {
   const ref = useRef<HTMLCanvasElement>(null)
+  const binsBufRef = useRef<Uint8Array<ArrayBuffer> | null>(null)
 
   useEffect(() => {
     const canvas = ref.current
@@ -18,23 +19,29 @@ export default function Spectrum({ analyser, active }: Props) {
       const dpr = window.devicePixelRatio || 1
       const w = canvas.clientWidth
       const h = canvas.clientHeight
-      if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-        canvas.width = Math.max(1, Math.floor(w * dpr))
-        canvas.height = Math.max(1, Math.floor(h * dpr))
+      const pw = Math.max(1, Math.floor(w * dpr))
+      const ph = Math.max(1, Math.floor(h * dpr))
+      if (canvas.width !== pw || canvas.height !== ph) {
+        canvas.width = pw
+        canvas.height = ph
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.fillStyle = 'rgba(12,13,16,0.35)'
       ctx.fillRect(0, 0, w, h)
 
+      const analyser = analyserRef.current
       if (analyser && active) {
         const bins = analyser.frequencyBinCount
-        const data = new Uint8Array(bins)
+        if (!binsBufRef.current || binsBufRef.current.length !== bins) {
+          binsBufRef.current = new Uint8Array(new ArrayBuffer(bins))
+        }
+        const data = binsBufRef.current
         analyser.getByteFrequencyData(data)
         const bars = 72
         const gap = 2
         const bw = (w - gap * bars) / bars
         for (let i = 0; i < bars; i++) {
-          const idx = Math.floor(Math.pow(i / bars, 1.6) * bins)
+          const idx = Math.min(bins - 1, Math.floor(Math.pow(i / bars, 1.6) * bins))
           const v = data[idx] / 255
           const bh = Math.max(2, v * h)
           const x = i * (bw + gap)
@@ -52,7 +59,7 @@ export default function Spectrum({ analyser, active }: Props) {
     }
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
-  }, [analyser, active])
+  }, [analyserRef, active])
 
-  return <canvas ref={ref} className="spec-canvas" />
+  return <canvas ref={ref} className="spec-canvas" aria-hidden="true" />
 }

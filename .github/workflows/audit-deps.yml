@@ -6,45 +6,53 @@ on:
     - cron: "0 6 * * 3"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
 jobs:
   deps:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: write
-      issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Deterministic npm audit
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+      - name: Check OpenRouter API Key
+        id: check_key
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENROUTER_API_KEY ist nicht gesetzt — deterministischer npm-Audit war erfolgreich, KI-Bericht wird übersprungen."
+          fi
+
       - name: Run OpenCode Dependency Audit
-        uses: anomalyco/opencode/github@latest
+        if: steps.check_key.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: anomalyco/opencode/github@v1
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:
           model: openrouter/google/gemini-2.5-flash
           prompt: |
-            Führe einen Dependency-Audit durch:
-            
-            1. PAKETERKENNUNG
-            - Erkenne das Paket-System (npm, pip, cargo, go)
-            - Sammle alle direkten und transitive Dependencies
-            
-            2. SICHERHEITS-CHECKS
-            - Führe npm audit / pip-audit / cargo audit aus
-            - Prüfe auf bekannte CVEs
-            - Identifiziere kritische Schwachstellen
-            
-            3. VERALTETE PAKETE
-            - Identifiziere veraltete Dependencies
-            - Prüfe auf End-of-Life Pakete
-            - Analysiere Major-Version-Unterschiede
-            
-            4. LIZENZ-ANALYSE
-            - Sammle alle Lizenzen der Dependencies
-            - Identifiziere Lizenzkonflikte (GPL vs Proprietär)
-            
-            Erstelle ein GitHub Issue für kritische Probleme.
-            Bei keinen kritischen Problemen: Kein Issue erstellen.
+            Führe einen ergänzenden Dependency- und Lizenz-Audit für dieses npm-Projekt durch:
+            1. Prüfe npm audit und npm outdated.
+            2. Prüfe Lizenzkompatibilität (keine GPL/AGPL-Abhängigkeiten).
+            Erstelle nur bei kritischen Befunden ein GitHub Issue.

@@ -1,11 +1,23 @@
 import type { AnalysisResult } from './detectPitch'
+import type { WavBits } from './exportWav'
 import type { LoudnessReport } from './loudness'
-import { rawToBuffer } from './raw'
+import { copyChannels, rawToBuffer } from './raw'
 
 type ProgressFn = (p: number, label: string) => void
 
 let worker: Worker | null = null
 let jobId = 0
+const activeJobs = new Map<number, (reason: Error) => void>()
+
+function makeAbortError(message = 'Vorgang abgebrochen'): Error {
+  const err = new Error(message)
+  err.name = 'AbortError'
+  return err
+}
+
+export function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError'
+}
 
 function getWorker(): Worker {
   if (!worker) {
@@ -14,15 +26,17 @@ function getWorker(): Worker {
   return worker
 }
 
-export function resetWorker() {
-  worker?.terminate()
-  worker = null
-}
-
-function copyChannels(buffer: AudioBuffer): Float32Array[] {
-  const out: Float32Array[] = []
-  for (let c = 0; c < buffer.numberOfChannels; c++) out.push(buffer.getChannelData(c).slice())
-  return out
+export function resetWorker(): void {
+  const pending = [...activeJobs.values()]
+  activeJobs.clear()
+  if (worker) {
+    worker.terminate()
+    worker = null
+  }
+  const abortErr = makeAbortError()
+  for (const rejectJob of pending) {
+    rejectJob(abortErr)
+  }
 }
 
 export function analyzeInWorker(
@@ -33,8 +47,21 @@ export function analyzeInWorker(
   const channels = copyChannels(buffer)
   return new Promise((resolve, reject) => {
     const w = getWorker()
+    const cleanup = () => {
+      activeJobs.delete(id)
+      w.removeEventListener('message', onMsg)
+      w.removeEventListener('error', onErr)
+    }
     const onMsg = (e: MessageEvent) => {
-      const data = e.data as { type: string; id: number; p?: number; label?: string; analysis?: AnalysisResult; loudness?: LoudnessReport; message?: string }
+      const data = e.data as {
+        type: string
+        id: number
+        p?: number
+        label?: string
+        analysis?: AnalysisResult
+        loudness?: LoudnessReport
+        message?: string
+      }
       if (data.id !== id) return
       if (data.type === 'progress') onProgress?.(data.p ?? 0, data.label ?? '')
       if (data.type === 'analysis' && data.analysis && data.loudness) {
@@ -50,18 +77,21 @@ export function analyzeInWorker(
       cleanup()
       reject(new Error('Worker-Fehler bei der Analyse'))
     }
-    const cleanup = () => {
-      w.removeEventListener('message', onMsg)
-      w.removeEventListener('error', onErr)
-    }
+    activeJobs.set(id, (reason) => {
+      cleanup()
+      reject(reason)
+    })
     w.addEventListener('message', onMsg)
     w.addEventListener('error', onErr)
-    w.postMessage({ type: 'analyze', id, sampleRate: buffer.sampleRate, channels }, channels.map((c) => c.buffer))
+    w.postMessage(
+      { type: 'analyze', id, sampleRate: buffer.sampleRate, channels },
+      channels.map((c) => c.buffer),
+    )
   })
 }
 
 export function processInWorker(
-  ctx: AudioContext,
+  ctx: BaseAudioContext,
   buffer: AudioBuffer,
   ratio: number,
   preserveTempo: boolean,
@@ -73,6 +103,11 @@ export function processInWorker(
   const channels = copyChannels(buffer)
   return new Promise((resolve, reject) => {
     const w = getWorker()
+    const cleanup = () => {
+      activeJobs.delete(id)
+      w.removeEventListener('message', onMsg)
+      w.removeEventListener('error', onErr)
+    }
     const onMsg = (e: MessageEvent) => {
       const data = e.data as {
         type: string
@@ -100,10 +135,10 @@ export function processInWorker(
       cleanup()
       reject(new Error('Worker-Fehler bei der Umwandlung'))
     }
-    const cleanup = () => {
-      w.removeEventListener('message', onMsg)
-      w.removeEventListener('error', onErr)
-    }
+    activeJobs.set(id, (reason) => {
+      cleanup()
+      reject(reason)
+    })
     w.addEventListener('message', onMsg)
     w.addEventListener('error', onErr)
     w.postMessage(
@@ -113,4 +148,46 @@ export function processInWorker(
   })
 }
 
-export { rawToBuffer }
+export function encodeWavInWorker(buffer: AudioBuffer, bits: WavBits): Promise<Blob> {
+  const id = ++jobId
+  const channels = copyChannels(buffer)
+  return new Promise((resolve, reject) => {
+    const w = getWorker()
+    const cleanup = () => {
+      activeJobs.delete(id)
+      w.removeEventListener('message', onMsg)
+      w.removeEventListener('error', onErr)
+    }
+    const onMsg = (e: MessageEvent) => {
+      const data = e.data as {
+        type: string
+        id: number
+        wavBytes?: ArrayBuffer
+        message?: string
+      }
+      if (data.id !== id) return
+      if (data.type === 'wav' && data.wavBytes) {
+        cleanup()
+        resolve(new Blob([data.wavBytes], { type: 'audio/wav' }))
+      }
+      if (data.type === 'error') {
+        cleanup()
+        reject(new Error(data.message || 'WAV-Export fehlgeschlagen'))
+      }
+    }
+    const onErr = () => {
+      cleanup()
+      reject(new Error('Worker-Fehler beim WAV-Export'))
+    }
+    activeJobs.set(id, (reason) => {
+      cleanup()
+      reject(reason)
+    })
+    w.addEventListener('message', onMsg)
+    w.addEventListener('error', onErr)
+    w.postMessage(
+      { type: 'encodeWav', id, sampleRate: buffer.sampleRate, channels, bits },
+      channels.map((c) => c.buffer),
+    )
+  })
+}
