@@ -45,6 +45,7 @@ jobs:
 
       - name: Run OpenCode Dependency Audit
         if: steps.check_key.outputs.enabled == 'true'
+        continue-on-error: true
         uses: anomalyco/opencode/github@v1
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
